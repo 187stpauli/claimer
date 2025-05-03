@@ -1,0 +1,6 @@
+{
+  "chain_id": 42161,
+  "rpc_url": "https://arbitrum-one-rpc.publicnode.com",
+  "explorer_url": "https://arbiscan.io/",
+  "contract_address": "0x060e7c1bc320C9e7C1760e06A5455c343D16603B"
+}
