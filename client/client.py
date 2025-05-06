@@ -2,26 +2,19 @@ from functools import wraps
 from aiohttp import ClientHttpProxyError
 from eth_account import Account
 from web3.middleware.geth_poa import async_geth_poa_middleware
-from web3.exceptions import TransactionNotFound
+from web3.exceptions import TransactionNotFound, TimeExhausted
 from web3 import AsyncWeb3, AsyncHTTPProvider
 from web3.contract import AsyncContract
 from typing import Optional, Union
 from web3.types import TxParams
 from hexbytes import HexBytes
 from client.networks import Network
+from utils.logger import logger
 import asyncio
-import logging
 import json
 
 with open("abi/erc20_abi.json", "r", encoding="utf-8") as file:
     ERC20_ABI = json.load(file)
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
 
 
 def retry_on_proxy_error(max_attempts: int = 3, fallback_no_proxy: bool = True):
@@ -35,16 +28,16 @@ def retry_on_proxy_error(max_attempts: int = 3, fallback_no_proxy: bool = True):
             while attempts < max_attempts:
                 try:
                     return await func(self, *args, **kwargs)
-                except ClientHttpProxyError as e:
+                except (ClientHttpProxyError, TimeExhausted, ConnectionError) as e:
                     attempts += 1
                     last_error = e
-                    logger.warning(f"🧹 Ошибка прокси (попытка {attempts}/{max_attempts}): {e}")
+                    logger.warning(f"🧹 Ошибка запроса (попытка {attempts}/{max_attempts}): {e}")
                     if attempts == max_attempts and fallback_no_proxy:
                         logger.info("Отключаем прокси для последней попытки")
                         self._disable_proxy()
                         try:
                             return await func(self, *args, **kwargs)
-                        except ClientHttpProxyError as e:
+                        except (ClientHttpProxyError, TimeExhausted, ConnectionError) as e:
                             last_error = e
                     await asyncio.sleep(1)
             raise ValueError(f"❌ Не удалось выполнить запрос после {max_attempts} попыток: {last_error}")
@@ -85,6 +78,13 @@ class Client:
         self.eip_1559 = True
         self.address = self.w3.to_checksum_address(
             self.w3.eth.account.from_key(self.private_key).address)
+
+    def _disable_proxy(self):
+        """Отключение прокси для fallback запросов"""
+        self.w3 = AsyncWeb3(AsyncHTTPProvider(self.rpc_url))
+        if self.network.is_poa:
+            self.w3.middleware_onion.clear()
+            self.w3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
 
     # Получение баланса нативного токена
     async def get_native_balance(self) -> float:
@@ -137,6 +137,18 @@ class Client:
             fallback_gas_price = await self.w3.eth.gas_price
             return fallback_gas_price * 70_000
 
+    async def check_eth_for_gas(self) -> bool:
+        """Проверяет достаточно ли ETH для оплаты газа"""
+        gas_price = await self.w3.eth.gas_price
+        estimated_gas = 70_000  # Приблизительное значение газа
+        required_wei = gas_price * estimated_gas * 1.5  # С запасом
+        balance = await self.get_native_balance()
+        
+        if balance < required_wei:
+            logger.error(f"❌ Недостаточно ETH для газа. Нужно минимум {self.w3.from_wei(required_wei, 'ether')} ETH")
+            return False
+        return True
+
     # Преобразование в веи
     async def to_wei_main(self, number: int | float, token_address: Optional[str] = None):
         if token_address:
@@ -144,16 +156,9 @@ class Client:
             decimals = await contract.functions.decimals().call()
         else:
             decimals = 18
-
-        unit_name = {
-            6: "mwei",
-            9: "gwei",
-            18: "ether"
-        }.get(decimals)
-
-        if not unit_name:
-            raise RuntimeError(f"Невозможно найти имя юнита с децималами: {decimals}")
-        return self.w3.to_wei(number, unit_name)
+        
+        # Используем универсальный подход вместо фиксированных значений
+        return int(number * (10 ** decimals))
 
     # Преобразование из веи
     async def from_wei_main(self, number: int | float, token_address: Optional[str] = None):
@@ -162,16 +167,9 @@ class Client:
             decimals = await contract.functions.decimals().call()
         else:
             decimals = 18
-
-        unit_name = {
-            6: "mwei",
-            9: "gwei",
-            18: "ether"
-        }.get(decimals)
-
-        if not unit_name:
-            raise RuntimeError(f"Невозможно найти имя юнита с децималами: {decimals}")
-        return self.w3.from_wei(number, unit_name)
+        
+        # Используем универсальный подход вместо фиксированных значений
+        return number / (10 ** decimals)
 
     # Approve
     async def approve_usdc(self, usdc_address, spender, amount, eip_1559: bool):
@@ -237,6 +235,9 @@ class Client:
     # Подпись и отправка транзакции
     async def sign_and_send_tx(self, transaction: TxParams, without_gas: bool = False):
         try:
+            # Проверяем достаточно ли ETH для оплаты газа
+            if not await self.check_eth_for_gas():
+                return None
 
             if not without_gas:
                 transaction["gas"] = int((await self.w3.eth.estimate_gas(transaction)) * 1.5)
@@ -257,9 +258,8 @@ class Client:
             return None
 
     # Ожидание результата транзакции
-    async def wait_tx(self, tx_hash: Union[str, HexBytes], explorer_url: Optional[str] = None) -> bool:
+    async def wait_tx(self, tx_hash: Union[str, HexBytes], explorer_url: Optional[str] = None, timeout: int = 120) -> bool:
         total_time = 0
-        timeout = 120
         poll_latency = 10
 
         tx_hash_bytes = HexBytes(tx_hash)  # Приведение к HexBytes
@@ -278,7 +278,7 @@ class Client:
                     return False
             except TransactionNotFound:
                 if total_time > timeout:
-                    logger.warning(f"❌ Транзакция {tx_hash_bytes.hex()} не подтвердилась за 120 секунд")
+                    logger.warning(f"❌ Транзакция {tx_hash_bytes.hex()} не подтвердилась за {timeout} секунд")
                     return False
                 total_time += poll_latency
                 await asyncio.sleep(poll_latency)
